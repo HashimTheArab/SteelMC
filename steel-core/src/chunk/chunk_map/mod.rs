@@ -81,6 +81,8 @@ mod light_update_state;
 mod light_updates;
 mod persistence;
 mod player_tracking;
+mod region_generation;
+pub use region_generation::RegionGenerationError;
 mod scheduled_ticks;
 
 #[cfg(test)]
