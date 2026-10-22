@@ -2,7 +2,8 @@
 
 use std::sync::{Arc, atomic::Ordering};
 
-use futures::future::join_all;
+use futures::future::{BoxFuture, FutureExt, Shared, join_all};
+use rustc_hash::FxHashMap;
 use steel_utils::ChunkPos;
 use thiserror::Error;
 
@@ -18,8 +19,10 @@ use crate::chunk::{
 
 const FULL_STEP: &ChunkStep = GENERATION_PYRAMID.get_step_to(ChunkStatus::Full);
 
+type RegionTask = Shared<BoxFuture<'static, Result<(), RegionGenerationError>>>;
+
 /// Why [`ChunkMap::generate_region`] could not generate a region.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum RegionGenerationError {
     /// The map already has holders or its generation refill loop is running.
     #[error("region generation needs an empty chunk map with its refill loop stopped")]
@@ -43,12 +46,12 @@ pub enum RegionGenerationError {
 }
 
 impl ChunkMap {
-    /// Generates every chunk in `min..=max` to Full and returns their holders in Z-then-X order.
+    /// Generates every chunk in `min..=max` to Full and returns their holders in X-then-Z order.
     ///
     /// Each status is finished across the region and its dependency halo before the next
-    /// starts, so shared dependencies run once rather than once per requested chunk. Steps that
-    /// touch neighboring chunks run in phases whose areas are disjoint, which makes the result
-    /// independent of thread scheduling.
+    /// starts, so shared dependencies run once rather than once per requested chunk. Chunks
+    /// whose step areas overlap run in ascending X-then-Z order and others run in parallel, so
+    /// the result equals generating one chunk at a time and does not depend on thread scheduling.
     ///
     /// The map must be empty with its refill loop stopped, and nothing else may drive it until
     /// this returns. The holders bypass tickets, so they are never saved or unloaded.
@@ -68,23 +71,12 @@ impl ChunkMap {
 
         let mut status = Some(ChunkStatus::Empty);
         while let Some(current) = status {
-            let step = GENERATION_PYRAMID.get_step_to(current);
             let radius = FULL_STEP.get_accumulated_radius_of(current) as i32;
-            let positions = region_positions(min, max, radius);
-            let period = region_step_reach(step) * 2 + 1;
-            for phase_x in 0..period {
-                for phase_z in 0..period {
-                    let phase = positions
-                        .iter()
-                        .filter(|pos| {
-                            pos.0.x.rem_euclid(period) == phase_x
-                                && pos.0.y.rem_euclid(period) == phase_z
-                        })
-                        .copied()
-                        .collect::<Vec<_>>();
-                    self.generate_region_phase(step, &phase).await?;
-                }
-            }
+            self.generate_region_stage(
+                GENERATION_PYRAMID.get_step_to(current),
+                region_positions(min, max, radius),
+            )
+            .await?;
             status = current.next();
         }
 
@@ -136,38 +128,65 @@ impl ChunkMap {
         Ok(())
     }
 
-    /// Applies `step` to `positions`, whose areas must not overlap, through the normal step path.
-    async fn generate_region_phase(
+    /// Applies `step` to `positions`, listed in ascending X-then-Z order.
+    ///
+    /// A chunk waits only for earlier chunks whose step areas overlap its own, so the result
+    /// equals applying the step to one chunk at a time in that order.
+    async fn generate_region_stage(
         self: &Arc<Self>,
         step: &'static ChunkStep,
-        positions: &[ChunkPos],
+        positions: Vec<ChunkPos>,
     ) -> Result<(), RegionGenerationError> {
-        let cache_radius =
-            (step.direct_dependencies.get_radius() as i32).max(region_step_reach(step));
-        let mut pending = Vec::with_capacity(positions.len());
-        for &pos in positions {
+        let reach = region_step_reach(step);
+        let cache_radius = (step.direct_dependencies.get_radius() as i32).max(reach);
+        // Areas of radius `reach` overlap within twice that distance.
+        let span = reach * 2;
+        let mut tasks = FxHashMap::<ChunkPos, RegionTask>::default();
+        for pos in positions {
+            let earlier = (pos.0.x - span..=pos.0.x)
+                .flat_map(|x| (pos.0.y - span..=pos.0.y + span).map(move |z| ChunkPos::new(x, z)))
+                .filter(|other| other.0.x < pos.0.x || other.0.y < pos.0.y)
+                .filter_map(|other| tasks.get(&other).cloned())
+                .collect::<Vec<_>>();
             let chunk_map = Arc::clone(self);
-            let cache = Arc::new(StaticCache2D::create(
-                pos.0.x,
-                pos.0.y,
-                cache_radius,
-                move |x, z| chunk_map.region_holder(ChunkPos::new(x, z)),
-            ));
-            let holder = Arc::clone(cache.get(pos.0.x, pos.0.y));
-            let failed = RegionGenerationError::StepFailed {
-                status: step.target_status,
-                pos,
+            let task = async move {
+                for task in earlier {
+                    task.await?;
+                }
+                chunk_map.apply_region_step(step, pos, cache_radius).await
             };
-            let Some(ready) =
-                holder.apply_step(step, self, &cache, Arc::clone(&self.generation_pool))
-            else {
-                return Err(failed);
-            };
-            pending.push(async move { ready.await.ok_or(failed) });
+            tasks.insert(pos, task.boxed().shared());
         }
-        join_all(pending).await.into_iter().collect()
+        join_all(tasks.into_values()).await.into_iter().collect()
     }
 
+    /// Runs one step on one chunk through the same path as ticket-driven generation.
+    async fn apply_region_step(
+        self: Arc<Self>,
+        step: &'static ChunkStep,
+        pos: ChunkPos,
+        cache_radius: i32,
+    ) -> Result<(), RegionGenerationError> {
+        let chunk_map = Arc::clone(&self);
+        let cache = Arc::new(StaticCache2D::create(
+            pos.0.x,
+            pos.0.y,
+            cache_radius,
+            move |x, z| chunk_map.region_holder(ChunkPos::new(x, z)),
+        ));
+        let holder = cache.get(pos.0.x, pos.0.y);
+        let ready = holder.apply_step(step, &self, &cache, Arc::clone(&self.generation_pool));
+        let failed = RegionGenerationError::StepFailed {
+            status: step.target_status,
+            pos,
+        };
+        match ready {
+            Some(ready) => ready.await.ok_or(failed),
+            None => Err(failed),
+        }
+    }
+
+    /// Returns a holder installed by [`Self::insert_region_holders`].
     fn region_holder(&self, pos: ChunkPos) -> Arc<ChunkHolder> {
         let Some(holder) = self.chunks.read_sync(&pos, |_, holder| Arc::clone(holder)) else {
             panic!("region generation installs a holder for every dependency, missing {pos:?}");
@@ -187,9 +206,9 @@ const fn region_step_reach(step: &ChunkStep) -> i32 {
     }
 }
 
-/// Lists the rectangle expanded by `radius` in Z-then-X order.
+/// Lists the rectangle expanded by `radius` in ascending X-then-Z order.
 fn region_positions(min: ChunkPos, max: ChunkPos, radius: i32) -> Vec<ChunkPos> {
-    (min.0.y - radius..=max.0.y + radius)
-        .flat_map(|z| (min.0.x - radius..=max.0.x + radius).map(move |x| ChunkPos::new(x, z)))
+    (min.0.x - radius..=max.0.x + radius)
+        .flat_map(|x| (min.0.y - radius..=max.0.y + radius).map(move |z| ChunkPos::new(x, z)))
         .collect()
 }

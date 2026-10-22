@@ -11,7 +11,8 @@ use toml::map::Map;
 use super::*;
 use crate::bootstrap::init_globals;
 use crate::chunk::chunk_map::RegionGenerationError;
-use crate::chunk::chunk_request::{ChunkRequest, ChunkTicketKind};
+use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
+use crate::chunk::chunk_request::{ChunkRequest, ChunkRequestHandle, ChunkTicketKind, ReadyChunks};
 use crate::entity::damage::DamageHistory;
 use crate::level_data::{GameTimeSource, WorldGenerationSettings};
 use crate::world::{WorldConfig, WorldStorageConfig};
@@ -114,33 +115,56 @@ fn overworld(key: &'static str, threads: usize) -> GeneratedWorld {
 }
 
 fn rectangle(min: ChunkPos, max: ChunkPos) -> Vec<ChunkPos> {
-    (min.0.y..=max.0.y)
-        .flat_map(|z| (min.0.x..=max.0.x).map(move |x| ChunkPos::new(x, z)))
+    (min.0.x..=max.0.x)
+        .flat_map(|x| (min.0.y..=max.0.y).map(move |z| ChunkPos::new(x, z)))
         .collect()
 }
 
+async fn await_request(chunk_map: &Arc<ChunkMap>, request: &ChunkRequestHandle) -> ReadyChunks {
+    loop {
+        chunk_map.advance_scheduling();
+        if let Some(ready) = request.ready_chunks() {
+            return ready;
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Generates through tickets, decorating one chunk at a time in ascending X-then-Z order.
+///
+/// Ticket generation otherwise runs neighboring Features steps in scheduling order, and
+/// overlapping decorations then differ between runs.
 fn generate_with_tickets(
     world: &Arc<World>,
-    positions: &[ChunkPos],
+    min: ChunkPos,
+    max: ChunkPos,
 ) -> FxHashMap<ChunkPos, ChunkContents> {
     let chunk_map = &world.chunk_map;
+    let feature_radius = GENERATION_PYRAMID
+        .get_step_to(ChunkStatus::Full)
+        .get_accumulated_radius_of(ChunkStatus::Features) as i32;
     let contents = chunk_map.chunk_runtime.block_on(async {
+        let mut decorated = Vec::new();
+        for pos in rectangle(
+            ChunkPos::new(min.0.x - feature_radius, min.0.y - feature_radius),
+            ChunkPos::new(max.0.x + feature_radius, max.0.y + feature_radius),
+        ) {
+            let request =
+                chunk_map.request_chunk(pos, ChunkStatus::Features, ChunkTicketKind::Command);
+            await_request(chunk_map, &request).await;
+            decorated.push(request);
+        }
         let request = chunk_map.request_chunks(ChunkRequest {
             status: ChunkStatus::Full,
-            positions: positions.to_vec(),
+            positions: rectangle(min, max),
             ticket_kind: ChunkTicketKind::Command,
         });
-        loop {
-            chunk_map.advance_scheduling();
-            if let Some(ready) = request.ready_chunks() {
-                break ready
-                    .holders
-                    .iter()
-                    .map(|holder| (holder.get_pos(), ChunkContents::of(holder)))
-                    .collect();
-            }
-            sleep(Duration::from_millis(1)).await;
-        }
+        await_request(chunk_map, &request)
+            .await
+            .holders
+            .iter()
+            .map(|holder| (holder.get_pos(), ChunkContents::of(holder)))
+            .collect()
     });
     stop_chunk_tasks(world);
     contents
@@ -179,7 +203,7 @@ fn region_generation_matches_ticket_generation() {
     let max = ChunkPos::new(1, 3);
 
     let ticketed = overworld("ticketed", 4);
-    let expected = generate_with_tickets(&ticketed.world, &rectangle(min, max));
+    let expected = generate_with_tickets(&ticketed.world, min, max);
     let region = overworld("region", 4);
     let actual = generate_region(&region.world, min, max);
 
