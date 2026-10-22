@@ -27,7 +27,7 @@ pub enum RegionGenerationError {
     /// The map has active or unloading holders, or its generation refill loop is running.
     #[error("region generation needs an empty chunk map with its refill loop stopped")]
     MapInUse,
-    /// `min` exceeds `max` on an axis, or the region is too close to the coordinate limits.
+    /// `min` exceeds `max` on an axis, or the region's dependency halo leaves the valid chunk range.
     #[error("invalid region bounds {min:?}..={max:?}")]
     InvalidBounds {
         /// Requested minimum corner.
@@ -61,8 +61,7 @@ impl ChunkMap {
         max: ChunkPos,
     ) -> Result<Vec<Arc<ChunkHolder>>, RegionGenerationError> {
         let halo = FULL_STEP.get_accumulated_radius_of(ChunkStatus::Empty) as i32;
-        // Leaves room for generation to address another halo of blocks past the region's halo.
-        let limit = (i32::MAX >> 4) - halo * 2;
+        let limit = ChunkPos::MAX_COORDINATE_VALUE - halo;
         let in_range = |low: i32, high: i32| low <= high && low >= -limit && high <= limit;
         if !in_range(min.0.x, max.0.x) || !in_range(min.0.y, max.0.y) {
             return Err(RegionGenerationError::InvalidBounds { min, max });
@@ -129,51 +128,42 @@ impl ChunkMap {
     }
 
     /// Applies `step` to `positions` as if one chunk at a time in [`region_step_order`].
-    ///
-    /// A chunk waits only for earlier chunks within the step's conflict distance or, for
-    /// Features, earlier chunks that place pieces from the same structure starts.
     async fn generate_region_stage(
         self: &Arc<Self>,
         step: &'static ChunkStep,
         positions: Vec<ChunkPos>,
     ) -> Result<(), RegionGenerationError> {
         let (read_radius, _) = region_step_radii(step);
-        let conflict = region_conflict_distance(step);
-        let mut tasks = FxHashMap::<ChunkPos, RegionTask>::default();
-        // Latest task that updates each structure-start chunk.
-        let mut start_users = FxHashMap::<ChunkPos, RegionTask>::default();
-        for pos in region_step_order(step, positions) {
-            let mut earlier = (pos.0.x - conflict..=pos.0.x + conflict)
-                .flat_map(|x| {
-                    (pos.0.y - conflict..=pos.0.y + conflict).map(move |z| ChunkPos::new(x, z))
-                })
-                .filter_map(|other| tasks.get(&other).cloned())
+        let order = region_step_order(step, positions);
+        let starts = order
+            .iter()
+            .map(|&pos| {
+                if step.target_status == ChunkStatus::Features {
+                    self.referenced_structure_starts(pos)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect::<Vec<_>>();
+        let dependencies =
+            region_step_dependencies(region_conflict_distance(step), &order, &starts);
+
+        let mut tasks = Vec::<RegionTask>::with_capacity(order.len());
+        for (&pos, dependencies) in order.iter().zip(dependencies) {
+            let earlier = dependencies
+                .into_iter()
+                .map(|index| tasks[index].clone())
                 .collect::<Vec<_>>();
-            let starts = if step.target_status == ChunkStatus::Features {
-                self.referenced_structure_starts(pos)
-            } else {
-                Vec::new()
-            };
-            earlier.extend(
-                starts
-                    .iter()
-                    .filter_map(|start| start_users.get(start).cloned()),
-            );
             let chunk_map = Arc::clone(self);
             let task = async move {
                 for task in earlier {
                     task.await?;
                 }
                 chunk_map.apply_region_step(step, pos, read_radius).await
-            }
-            .boxed()
-            .shared();
-            for start in starts {
-                start_users.insert(start, task.clone());
-            }
-            tasks.insert(pos, task);
+            };
+            tasks.push(task.boxed().shared());
         }
-        join_all(tasks.into_values()).await.into_iter().collect()
+        join_all(tasks).await.into_iter().collect()
     }
 
     /// Runs one step on one chunk through the same path as ticket-driven generation.
@@ -267,9 +257,122 @@ pub(super) fn region_step_order(step: &ChunkStep, mut positions: Vec<ChunkPos>) 
     positions
 }
 
+/// Returns, for each position in `order`, the earlier positions it must wait for.
+///
+/// A position waits for earlier ones within `conflict` and for the previous user of each
+/// structure-start chunk in its `starts` entry, which orders all users of that start.
+fn region_step_dependencies(
+    conflict: i32,
+    order: &[ChunkPos],
+    starts: &[Vec<ChunkPos>],
+) -> Vec<Vec<usize>> {
+    let indices = order
+        .iter()
+        .enumerate()
+        .map(|(index, &pos)| (pos, index))
+        .collect::<FxHashMap<_, _>>();
+    let mut start_users = FxHashMap::<ChunkPos, usize>::default();
+    order
+        .iter()
+        .zip(starts)
+        .enumerate()
+        .map(|(index, (pos, starts))| {
+            let mut earlier = (pos.0.x - conflict..=pos.0.x + conflict)
+                .flat_map(|x| {
+                    (pos.0.y - conflict..=pos.0.y + conflict).map(move |z| ChunkPos::new(x, z))
+                })
+                .filter_map(|other| indices.get(&other).copied())
+                .filter(|&other| other < index)
+                .collect::<Vec<_>>();
+            earlier.extend(
+                starts
+                    .iter()
+                    .filter_map(|&start| start_users.insert(start, index)),
+            );
+            earlier
+        })
+        .collect()
+}
+
 /// Lists the rectangle expanded by `radius` in ascending X-then-Z order.
 fn region_positions(min: ChunkPos, max: ChunkPos, radius: i32) -> Vec<ChunkPos> {
     (min.0.x - radius..=max.0.x + radius)
         .flat_map(|x| (min.0.y - radius..=max.0.y + radius).map(move |z| ChunkPos::new(x, z)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns the positions `pos` waits for when the given positions run `status` in order.
+    fn waits_for(
+        status: ChunkStatus,
+        positions: &[ChunkPos],
+        starts: &[Vec<ChunkPos>],
+        pos: ChunkPos,
+    ) -> Vec<ChunkPos> {
+        let step = GENERATION_PYRAMID.get_step_to(status);
+        let order = positions.to_vec();
+        let dependencies = region_step_dependencies(region_conflict_distance(step), &order, starts);
+        let Some(index) = order.iter().position(|&other| other == pos) else {
+            panic!("{pos:?} should be listed");
+        };
+        dependencies[index]
+            .iter()
+            .map(|&other| order[other])
+            .collect()
+    }
+
+    #[test]
+    fn features_wait_for_their_full_read_footprint() {
+        let positions = [
+            ChunkPos::new(0, 0),
+            ChunkPos::new(19, 0),
+            ChunkPos::new(9, 0),
+        ];
+        let starts = vec![Vec::new(); positions.len()];
+
+        assert_eq!(
+            waits_for(
+                ChunkStatus::Features,
+                &positions,
+                &starts,
+                ChunkPos::new(9, 0)
+            ),
+            [ChunkPos::new(0, 0)]
+        );
+    }
+
+    #[test]
+    fn light_waits_for_overlapping_cache_windows() {
+        let positions = [
+            ChunkPos::new(0, 0),
+            ChunkPos::new(9, 0),
+            ChunkPos::new(4, 0),
+        ];
+        let starts = vec![Vec::new(); positions.len()];
+
+        assert_eq!(
+            waits_for(ChunkStatus::Light, &positions, &starts, ChunkPos::new(4, 0)),
+            [ChunkPos::new(0, 0)]
+        );
+    }
+
+    #[test]
+    fn features_sharing_a_structure_start_wait_regardless_of_distance() {
+        let start = ChunkPos::new(10, 0);
+        let positions = [ChunkPos::new(0, 0), ChunkPos::new(20, 0)];
+        let starts = vec![vec![start], vec![start]];
+
+        assert_eq!(
+            waits_for(
+                ChunkStatus::Features,
+                &positions,
+                &starts,
+                ChunkPos::new(20, 0)
+            ),
+            [ChunkPos::new(0, 0)]
+        );
+    }
 }

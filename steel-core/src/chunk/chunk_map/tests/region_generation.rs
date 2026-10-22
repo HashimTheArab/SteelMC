@@ -279,6 +279,27 @@ fn region_generation_matches_ordered_ticket_generation() {
     });
 }
 
+/// Returns the largest chunk coordinate whose dependency halo stays within the valid range.
+fn region_coordinate_limit() -> i32 {
+    let halo = GENERATION_PYRAMID
+        .get_step_to(ChunkStatus::Full)
+        .get_accumulated_radius_of(ChunkStatus::Empty) as i32;
+    ChunkPos::MAX_COORDINATE_VALUE - halo
+}
+
+#[test]
+fn region_generation_accepts_the_coordinate_limit() {
+    let fixture = fresh_test_world("region_generation_limit");
+    stop_chunk_tasks(&fixture.world);
+    let chunk_map = &fixture.world.chunk_map;
+    let edge = ChunkPos::new(region_coordinate_limit(), -region_coordinate_limit());
+
+    let generated = chunk_map
+        .chunk_runtime
+        .block_on(chunk_map.generate_region(edge, edge));
+    assert!(generated.is_ok_and(|holders| holders.len() == 1));
+}
+
 #[test]
 fn region_generation_rejects_unusable_requests() {
     let fixture = fresh_test_world("region_generation_rejects");
@@ -298,10 +319,10 @@ fn region_generation_rejects_unusable_requests() {
         inverted,
         Err(RegionGenerationError::InvalidBounds { .. })
     ));
-    let edge = ChunkPos::new(i32::MAX >> 4, 0);
+    let beyond_limit = ChunkPos::new(-region_coordinate_limit() - 1, 0);
     let overflowing = chunk_map
         .chunk_runtime
-        .block_on(chunk_map.generate_region(edge, edge));
+        .block_on(chunk_map.generate_region(beyond_limit, pos));
     assert!(matches!(
         overflowing,
         Err(RegionGenerationError::InvalidBounds { .. })
