@@ -287,7 +287,8 @@ fn region_step_dependencies(
             earlier.extend(
                 starts
                     .iter()
-                    .filter_map(|&start| start_users.insert(start, index)),
+                    .filter_map(|&start| start_users.insert(start, index))
+                    .filter(|&user| user < index),
             );
             earlier
         })
@@ -363,7 +364,8 @@ mod tests {
     fn features_sharing_a_structure_start_wait_regardless_of_distance() {
         let start = ChunkPos::new(10, 0);
         let positions = [ChunkPos::new(0, 0), ChunkPos::new(20, 0)];
-        let starts = vec![vec![start], vec![start]];
+        // Several structures can start in one chunk, so a source may be listed twice.
+        let starts = vec![vec![start], vec![start, start]];
 
         assert_eq!(
             waits_for(
