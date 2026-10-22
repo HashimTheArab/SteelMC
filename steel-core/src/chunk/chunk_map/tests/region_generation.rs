@@ -1,4 +1,5 @@
 use std::panic;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -8,12 +9,13 @@ use steel_utils::types::{Difficulty, GameType};
 use steel_worldgen::biomes::BiomeSourceKind;
 use steel_worldgen::density_functions::overworld::OverworldNoiseSettings;
 use tokio::runtime::Builder as RuntimeBuilder;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use toml::map::Map;
 
 use super::*;
 use crate::bootstrap::init_globals;
 use crate::chunk::chunk_map::RegionGenerationError;
+use crate::chunk::chunk_map::region_generation::region_step_order;
 use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use crate::chunk::chunk_request::{ChunkRequest, ChunkRequestHandle, ChunkTicketKind, ReadyChunks};
 use crate::chunk::light::LightLayer;
@@ -24,13 +26,14 @@ use crate::worldgen::{ChunkGeneratorType, OverworldGenerator};
 
 const SEED: i64 = 13_579;
 
+/// A test world and the damage history it holds weakly.
 struct GeneratedWorld {
     world: Arc<World>,
     _damage_history: Arc<DamageHistory>,
 }
 
 const TEST_STACK_SIZE: usize = 16 * 1024 * 1024;
-const GENERATION_TIMEOUT: Duration = Duration::from_secs(600);
+const TEST_DEADLINE: Duration = Duration::from_secs(600);
 
 /// Every block state, biome and light level of a Full chunk.
 #[derive(PartialEq, Eq)]
@@ -41,6 +44,7 @@ struct ChunkContents {
 }
 
 impl ChunkContents {
+    /// Copies the contents of a Full chunk.
     fn of(holder: &ChunkHolder) -> Self {
         let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
             panic!("{:?} should be Full", holder.get_pos());
@@ -84,6 +88,7 @@ impl ChunkContents {
     }
 }
 
+/// Opens a RAM-only overworld with `threads` generation workers.
 fn overworld(key: &'static str, threads: usize) -> GeneratedWorld {
     init_globals();
     let pool = Arc::new(
@@ -145,33 +150,25 @@ fn overworld(key: &'static str, threads: usize) -> GeneratedWorld {
     }
 }
 
+/// Lists `min..=max` in ascending X-then-Z order.
 fn rectangle(min: ChunkPos, max: ChunkPos) -> Vec<ChunkPos> {
     (min.0.x..=max.0.x)
         .flat_map(|x| (min.0.y..=max.0.y).map(move |z| ChunkPos::new(x, z)))
         .collect()
 }
 
+/// Advances scheduling until every chunk of `request` is ready.
 async fn await_request(chunk_map: &Arc<ChunkMap>, request: &ChunkRequestHandle) -> ReadyChunks {
-    let ready = timeout(GENERATION_TIMEOUT, async {
-        loop {
-            chunk_map.advance_scheduling();
-            if let Some(ready) = request.ready_chunks() {
-                return ready;
-            }
-            sleep(Duration::from_millis(1)).await;
+    loop {
+        chunk_map.advance_scheduling();
+        if let Some(ready) = request.ready_chunks() {
+            return ready;
         }
-    })
-    .await;
-    match ready {
-        Ok(ready) => ready,
-        Err(elapsed) => panic!(
-            "ticket generation stalled ({elapsed}): {:?}",
-            request.poll()
-        ),
+        sleep(Duration::from_millis(1)).await;
     }
 }
 
-/// Generates through tickets, decorating one chunk at a time in ascending X-then-Z order.
+/// Generates through tickets, decorating one chunk at a time in region generation's order.
 ///
 /// Ticket generation otherwise runs neighboring Features steps in scheduling order, and
 /// overlapping decorations then differ between runs.
@@ -186,9 +183,13 @@ fn generate_with_tickets(
         .get_accumulated_radius_of(ChunkStatus::Features) as i32;
     let contents = chunk_map.chunk_runtime.block_on(async {
         let mut decorated = Vec::new();
-        for pos in rectangle(
+        let feature_positions = rectangle(
             ChunkPos::new(min.0.x - feature_radius, min.0.y - feature_radius),
             ChunkPos::new(max.0.x + feature_radius, max.0.y + feature_radius),
+        );
+        for pos in region_step_order(
+            GENERATION_PYRAMID.get_step_to(ChunkStatus::Features),
+            feature_positions,
         ) {
             let request =
                 chunk_map.request_chunk(pos, ChunkStatus::Features, ChunkTicketKind::Command);
@@ -211,23 +212,20 @@ fn generate_with_tickets(
     contents
 }
 
+/// Generates through [`ChunkMap::generate_region`] and checks the returned order.
 fn generate_region(
     world: &Arc<World>,
     min: ChunkPos,
     max: ChunkPos,
 ) -> FxHashMap<ChunkPos, ChunkContents> {
     stop_chunk_tasks(world);
-    let generated = world.chunk_map.chunk_runtime.block_on(async {
-        timeout(
-            GENERATION_TIMEOUT,
-            world.chunk_map.generate_region(min, max),
-        )
-        .await
-    });
-    let holders = match generated {
-        Ok(Ok(holders)) => holders,
-        Ok(Err(error)) => panic!("region generation failed: {error}"),
-        Err(elapsed) => panic!("region generation stalled ({elapsed})"),
+    let holders = match world
+        .chunk_map
+        .chunk_runtime
+        .block_on(world.chunk_map.generate_region(min, max))
+    {
+        Ok(holders) => holders,
+        Err(error) => panic!("region generation failed: {error}"),
     };
     assert_eq!(
         holders
@@ -242,15 +240,19 @@ fn generate_region(
         .collect()
 }
 
-/// Runs a test on a thread with room for debug-build worldgen recursion.
-fn with_large_stack(test: fn()) {
-    let result = thread::Builder::new()
+/// Runs a test with room for debug-build worldgen recursion, failing it after a deadline.
+fn run_generation_test(test: fn()) {
+    let (finished, result) = mpsc::channel();
+    thread::Builder::new()
         .stack_size(TEST_STACK_SIZE)
-        .spawn(test)
-        .expect("region generation test thread should spawn")
-        .join();
-    if let Err(payload) = result {
-        panic::resume_unwind(payload);
+        .spawn(move || {
+            let _ = finished.send(panic::catch_unwind(test));
+        })
+        .expect("region generation test thread should spawn");
+    match result.recv_timeout(TEST_DEADLINE) {
+        Ok(Ok(())) => {}
+        Ok(Err(payload)) => panic::resume_unwind(payload),
+        Err(error) => panic!("region generation test did not finish: {error}"),
     }
 }
 
@@ -258,7 +260,7 @@ fn with_large_stack(test: fn()) {
 /// reference requests Features one chunk at a time; region output must match at any thread count.
 #[test]
 fn region_generation_matches_ordered_ticket_generation() {
-    with_large_stack(|| {
+    run_generation_test(|| {
         let min = ChunkPos::new(-1, 2);
         let max = ChunkPos::new(1, 3);
 
@@ -305,4 +307,19 @@ fn region_generation_rejects_unusable_requests() {
         Err(RegionGenerationError::InvalidBounds { .. })
     ));
     assert!(chunk_map.chunks.is_empty());
+
+    let level = ChunkTicketLevel::MAX;
+    let Some(added) = chunk_map.acquire_chunk_request_leases(&[pos], level) else {
+        panic!("a request lease should produce a receipt");
+    };
+    advance_until_receipt(chunk_map, added);
+    let Some(removed) = chunk_map.release_chunk_request_leases(&[pos], level) else {
+        panic!("a request lease release should produce a receipt");
+    };
+    advance_until_receipt(chunk_map, removed);
+    assert!(chunk_map.chunks.is_empty() && chunk_map.unloading_chunks.contains_sync(&pos));
+    let unloading = chunk_map
+        .chunk_runtime
+        .block_on(chunk_map.generate_region(pos, pos));
+    assert_eq!(unloading.err(), Some(RegionGenerationError::MapInUse));
 }

@@ -24,7 +24,7 @@ type RegionTask = Shared<BoxFuture<'static, Result<(), RegionGenerationError>>>;
 /// Why [`ChunkMap::generate_region`] could not generate a region.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum RegionGenerationError {
-    /// The map already has holders or its generation refill loop is running.
+    /// The map has active or unloading holders, or its generation refill loop is running.
     #[error("region generation needs an empty chunk map with its refill loop stopped")]
     MapInUse,
     /// `min` exceeds `max` on an axis, or the region is too close to the coordinate limits.
@@ -50,8 +50,8 @@ impl ChunkMap {
     ///
     /// Each status is finished across the region and its dependency halo before the next
     /// starts, so shared dependencies run once rather than once per requested chunk. Chunks
-    /// whose step areas overlap run in ascending X-then-Z order and others run in parallel, so
-    /// the result equals generating one chunk at a time and does not depend on thread scheduling.
+    /// whose steps may touch the same data run in a fixed order and the rest in parallel, so the
+    /// result equals generating one chunk at a time and does not depend on thread scheduling.
     ///
     /// The map must be empty with its refill loop stopped, and nothing else may drive it until
     /// this returns. The holders have no tickets, so the map never unloads them.
@@ -94,7 +94,10 @@ impl ChunkMap {
         halo: i32,
     ) -> Result<(), RegionGenerationError> {
         let _source_phase_guard = self.source_phase_guard.lock();
-        if !self.generation_refill_stopped.load(Ordering::Acquire) || !self.chunks.is_empty() {
+        if !self.generation_refill_stopped.load(Ordering::Acquire)
+            || !self.chunks.is_empty()
+            || !self.unloading_chunks.is_empty()
+        {
             return Err(RegionGenerationError::MapInUse);
         }
 
@@ -125,27 +128,25 @@ impl ChunkMap {
         Ok(())
     }
 
-    /// Applies `step` to `positions`, listed in ascending X-then-Z order.
+    /// Applies `step` to `positions` as if one chunk at a time in [`region_step_order`].
     ///
-    /// A chunk waits only for earlier chunks whose step areas overlap its own or, for Features,
-    /// that place pieces from the same structure starts. The result therefore equals applying
-    /// the step to one chunk at a time in that order.
+    /// A chunk waits only for earlier chunks within the step's conflict distance or, for
+    /// Features, earlier chunks that place pieces from the same structure starts.
     async fn generate_region_stage(
         self: &Arc<Self>,
         step: &'static ChunkStep,
         positions: Vec<ChunkPos>,
     ) -> Result<(), RegionGenerationError> {
-        let reach = region_step_reach(step);
-        let cache_radius = (step.direct_dependencies.get_radius() as i32).max(reach);
-        // Areas of radius `reach` overlap within twice that distance.
-        let span = reach * 2;
+        let (read_radius, _) = region_step_radii(step);
+        let conflict = region_conflict_distance(step);
         let mut tasks = FxHashMap::<ChunkPos, RegionTask>::default();
         // Latest task that updates each structure-start chunk.
         let mut start_users = FxHashMap::<ChunkPos, RegionTask>::default();
-        for pos in positions {
-            let mut earlier = (pos.0.x - span..=pos.0.x)
-                .flat_map(|x| (pos.0.y - span..=pos.0.y + span).map(move |z| ChunkPos::new(x, z)))
-                .filter(|other| other.0.x < pos.0.x || other.0.y < pos.0.y)
+        for pos in region_step_order(step, positions) {
+            let mut earlier = (pos.0.x - conflict..=pos.0.x + conflict)
+                .flat_map(|x| {
+                    (pos.0.y - conflict..=pos.0.y + conflict).map(move |z| ChunkPos::new(x, z))
+                })
                 .filter_map(|other| tasks.get(&other).cloned())
                 .collect::<Vec<_>>();
             let starts = if step.target_status == ChunkStatus::Features {
@@ -163,7 +164,7 @@ impl ChunkMap {
                 for task in earlier {
                     task.await?;
                 }
-                chunk_map.apply_region_step(step, pos, cache_radius).await
+                chunk_map.apply_region_step(step, pos, read_radius).await
             }
             .boxed()
             .shared();
@@ -223,26 +224,47 @@ impl ChunkMap {
     }
 }
 
-/// Returns how far around its center a step that modifies neighbors may read or write chunks.
+/// Returns how far around its center `step` reads and writes chunks.
 ///
-/// Block reads count only where the parent status guarantees generated blocks. Light worksets
-/// span a cache window wider than the Light step's declared dependencies.
-const fn region_step_reach(step: &ChunkStep) -> i32 {
-    let parent_radius = match step.target_status.parent() {
-        Some(parent) => step.direct_dependencies.get_radius_of(parent) as i32,
-        None => 0,
-    };
+/// Light worksets span a cache window wider than the Light step's declared dependencies.
+const fn region_step_radii(step: &ChunkStep) -> (i32, i32) {
+    let read = step.direct_dependencies.get_radius() as i32;
     match step.target_status {
-        ChunkStatus::Light => LIGHT_CACHE_RADIUS,
-        _ if step.block_state_write_radius > 0 => {
-            if step.block_state_write_radius > parent_radius {
-                step.block_state_write_radius
-            } else {
-                parent_radius
-            }
-        }
-        _ => 0,
+        ChunkStatus::Light if read < LIGHT_CACHE_RADIUS => (LIGHT_CACHE_RADIUS, LIGHT_CACHE_RADIUS),
+        ChunkStatus::Light => (read, LIGHT_CACHE_RADIUS),
+        _ => (read, step.block_state_write_radius),
     }
+}
+
+/// Returns the distance within which one chunk's step may write what another's reads or writes.
+///
+/// Steps that only write their own chunk read neighbors at lower statuses, so they never conflict.
+const fn region_conflict_distance(step: &ChunkStep) -> i32 {
+    let (read, write) = region_step_radii(step);
+    if write <= 0 {
+        0
+    } else if read > write {
+        write + read
+    } else {
+        write * 2
+    }
+}
+
+/// Orders positions so that chunks sharing a phase are beyond the step's conflict distance.
+///
+/// Phases group positions by coordinates modulo the conflict distance plus one, then sort by X
+/// and Z. Any fixed order gives the same determinism; phases keep more chunks independent.
+pub(super) fn region_step_order(step: &ChunkStep, mut positions: Vec<ChunkPos>) -> Vec<ChunkPos> {
+    let period = region_conflict_distance(step) + 1;
+    positions.sort_by_key(|pos| {
+        (
+            pos.0.x.rem_euclid(period),
+            pos.0.y.rem_euclid(period),
+            pos.0.x,
+            pos.0.y,
+        )
+    });
+    positions
 }
 
 /// Lists the rectangle expanded by `radius` in ascending X-then-Z order.
