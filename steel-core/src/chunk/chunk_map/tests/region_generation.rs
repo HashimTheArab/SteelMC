@@ -1,3 +1,5 @@
+use std::panic;
+use std::thread;
 use std::time::Duration;
 
 use rustc_hash::FxHashMap;
@@ -5,7 +7,8 @@ use steel_utils::Identifier;
 use steel_utils::types::{Difficulty, GameType};
 use steel_worldgen::biomes::BiomeSourceKind;
 use steel_worldgen::density_functions::overworld::OverworldNoiseSettings;
-use tokio::time::sleep;
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::time::{sleep, timeout};
 use toml::map::Map;
 
 use super::*;
@@ -13,6 +16,7 @@ use crate::bootstrap::init_globals;
 use crate::chunk::chunk_map::RegionGenerationError;
 use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use crate::chunk::chunk_request::{ChunkRequest, ChunkRequestHandle, ChunkTicketKind, ReadyChunks};
+use crate::chunk::light::LightLayer;
 use crate::entity::damage::DamageHistory;
 use crate::level_data::{GameTimeSource, WorldGenerationSettings};
 use crate::world::{WorldConfig, WorldStorageConfig};
@@ -25,11 +29,15 @@ struct GeneratedWorld {
     _damage_history: Arc<DamageHistory>,
 }
 
-/// Every block state and biome of a Full chunk, in section order.
+const TEST_STACK_SIZE: usize = 16 * 1024 * 1024;
+const GENERATION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Every block state, biome and light level of a Full chunk.
 #[derive(PartialEq, Eq)]
 struct ChunkContents {
     blocks: Vec<u16>,
     biomes: Vec<u16>,
+    light: Vec<u8>,
 }
 
 impl ChunkContents {
@@ -56,7 +64,23 @@ impl ChunkContents {
                 }
             }
         }
-        Self { blocks, biomes }
+        let pos = holder.get_pos();
+        let light_data = chunk.light();
+        let mut light = Vec::new();
+        for y in holder.min_y()..holder.min_y() + holder.height() {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let block = BlockPos::new(pos.0.x * 16 + x, y, pos.0.y * 16 + z);
+                    light.push(light_data.get_light_value(LightLayer::Sky, block));
+                    light.push(light_data.get_light_value(LightLayer::Block, block));
+                }
+            }
+        }
+        Self {
+            blocks,
+            biomes,
+            light,
+        }
     }
 }
 
@@ -65,10 +89,17 @@ fn overworld(key: &'static str, threads: usize) -> GeneratedWorld {
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
+            .stack_size(TEST_STACK_SIZE)
             .build()
             .expect("region generation test pool should build"),
     );
-    let runtime = Arc::new(Runtime::new().expect("region generation test runtime should build"));
+    let runtime = Arc::new(
+        RuntimeBuilder::new_multi_thread()
+            .thread_stack_size(TEST_STACK_SIZE)
+            .enable_all()
+            .build()
+            .expect("region generation test runtime should build"),
+    );
     let generator = Arc::new(ChunkGeneratorType::Overworld(OverworldGenerator::new(
         None,
         BiomeSourceKind::overworld(SEED as u64),
@@ -121,12 +152,22 @@ fn rectangle(min: ChunkPos, max: ChunkPos) -> Vec<ChunkPos> {
 }
 
 async fn await_request(chunk_map: &Arc<ChunkMap>, request: &ChunkRequestHandle) -> ReadyChunks {
-    loop {
-        chunk_map.advance_scheduling();
-        if let Some(ready) = request.ready_chunks() {
-            return ready;
+    let ready = timeout(GENERATION_TIMEOUT, async {
+        loop {
+            chunk_map.advance_scheduling();
+            if let Some(ready) = request.ready_chunks() {
+                return ready;
+            }
+            sleep(Duration::from_millis(1)).await;
         }
-        sleep(Duration::from_millis(1)).await;
+    })
+    .await;
+    match ready {
+        Ok(ready) => ready,
+        Err(elapsed) => panic!(
+            "ticket generation stalled ({elapsed}): {:?}",
+            request.poll()
+        ),
     }
 }
 
@@ -176,13 +217,17 @@ fn generate_region(
     max: ChunkPos,
 ) -> FxHashMap<ChunkPos, ChunkContents> {
     stop_chunk_tasks(world);
-    let holders = match world
-        .chunk_map
-        .chunk_runtime
-        .block_on(world.chunk_map.generate_region(min, max))
-    {
-        Ok(holders) => holders,
-        Err(error) => panic!("region generation failed: {error}"),
+    let generated = world.chunk_map.chunk_runtime.block_on(async {
+        timeout(
+            GENERATION_TIMEOUT,
+            world.chunk_map.generate_region(min, max),
+        )
+        .await
+    });
+    let holders = match generated {
+        Ok(Ok(holders)) => holders,
+        Ok(Err(error)) => panic!("region generation failed: {error}"),
+        Err(elapsed) => panic!("region generation stalled ({elapsed})"),
     };
     assert_eq!(
         holders
@@ -197,27 +242,44 @@ fn generate_region(
         .collect()
 }
 
-#[test]
-fn region_generation_matches_ticket_generation() {
-    let min = ChunkPos::new(-1, 2);
-    let max = ChunkPos::new(1, 3);
-
-    let ticketed = overworld("ticketed", 4);
-    let expected = generate_with_tickets(&ticketed.world, min, max);
-    let region = overworld("region", 4);
-    let actual = generate_region(&region.world, min, max);
-
-    for pos in rectangle(min, max) {
-        assert!(
-            expected[&pos] == actual[&pos],
-            "region generation diverged from ticket generation at {pos:?}"
-        );
+/// Runs a test on a thread with room for debug-build worldgen recursion.
+fn with_large_stack(test: fn()) {
+    let result = thread::Builder::new()
+        .stack_size(TEST_STACK_SIZE)
+        .spawn(test)
+        .expect("region generation test thread should spawn")
+        .join();
+    if let Err(payload) = result {
+        panic::resume_unwind(payload);
     }
 }
 
+/// Unordered ticket generation decorates overlapping neighbors in scheduling order, so the
+/// reference requests Features one chunk at a time; region output must match at any thread count.
 #[test]
-fn region_generation_requires_an_unused_map() {
-    let fixture = overworld("unused_map", 1);
+fn region_generation_matches_ordered_ticket_generation() {
+    with_large_stack(|| {
+        let min = ChunkPos::new(-1, 2);
+        let max = ChunkPos::new(1, 3);
+
+        let ticketed = overworld("ticketed", 4);
+        let expected = generate_with_tickets(&ticketed.world, min, max);
+        for threads in [1, 4] {
+            let region = overworld("region", threads);
+            let actual = generate_region(&region.world, min, max);
+            for pos in rectangle(min, max) {
+                assert!(
+                    expected[&pos] == actual[&pos],
+                    "{threads}-thread region generation diverged from tickets at {pos:?}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn region_generation_rejects_unusable_requests() {
+    let fixture = fresh_test_world("region_generation_rejects");
     let chunk_map = &fixture.world.chunk_map;
     let pos = ChunkPos::new(0, 0);
 
@@ -232,6 +294,14 @@ fn region_generation_requires_an_unused_map() {
         .block_on(chunk_map.generate_region(ChunkPos::new(1, 0), pos));
     assert!(matches!(
         inverted,
+        Err(RegionGenerationError::InvalidBounds { .. })
+    ));
+    let edge = ChunkPos::new(i32::MAX >> 4, 0);
+    let overflowing = chunk_map
+        .chunk_runtime
+        .block_on(chunk_map.generate_region(edge, edge));
+    assert!(matches!(
+        overflowing,
         Err(RegionGenerationError::InvalidBounds { .. })
     ));
     assert!(chunk_map.chunks.is_empty());

@@ -27,7 +27,7 @@ pub enum RegionGenerationError {
     /// The map already has holders or its generation refill loop is running.
     #[error("region generation needs an empty chunk map with its refill loop stopped")]
     MapInUse,
-    /// `min` exceeds `max` on an axis, or the dependency halo leaves the coordinate range.
+    /// `min` exceeds `max` on an axis, or the region is too close to the coordinate limits.
     #[error("invalid region bounds {min:?}..={max:?}")]
     InvalidBounds {
         /// Requested minimum corner.
@@ -54,16 +54,16 @@ impl ChunkMap {
     /// the result equals generating one chunk at a time and does not depend on thread scheduling.
     ///
     /// The map must be empty with its refill loop stopped, and nothing else may drive it until
-    /// this returns. The holders bypass tickets, so they are never saved or unloaded.
+    /// this returns. The holders have no tickets, so the map never unloads them.
     pub async fn generate_region(
         self: &Arc<Self>,
         min: ChunkPos,
         max: ChunkPos,
     ) -> Result<Vec<Arc<ChunkHolder>>, RegionGenerationError> {
         let halo = FULL_STEP.get_accumulated_radius_of(ChunkStatus::Empty) as i32;
-        let in_range = |low: i32, high: i32| {
-            low <= high && low.checked_sub(halo).is_some() && high.checked_add(halo).is_some()
-        };
+        // Leaves room for generation to address another halo of blocks past the region's halo.
+        let limit = (i32::MAX >> 4) - halo * 2;
+        let in_range = |low: i32, high: i32| low <= high && low >= -limit && high <= limit;
         if !in_range(min.0.x, max.0.x) || !in_range(min.0.y, max.0.y) {
             return Err(RegionGenerationError::InvalidBounds { min, max });
         }
@@ -99,12 +99,8 @@ impl ChunkMap {
         }
 
         for pos in region_positions(min, max, halo) {
-            let dx = (min.0.x.saturating_sub(pos.0.x))
-                .max(pos.0.x.saturating_sub(max.0.x))
-                .max(0);
-            let dz = (min.0.y.saturating_sub(pos.0.y))
-                .max(pos.0.y.saturating_sub(max.0.y))
-                .max(0);
+            let dx = (min.0.x - pos.0.x).max(pos.0.x - max.0.x).max(0);
+            let dz = (min.0.y - pos.0.y).max(pos.0.y - max.0.y).max(0);
             let distance = dx.max(dz) as usize;
             let needed_status = if distance == 0 {
                 ChunkStatus::Full
@@ -114,12 +110,13 @@ impl ChunkMap {
                 };
                 status
             };
-            let holder = Arc::new(ChunkHolder::new(
+            let holder = Arc::new(ChunkHolder::new_with_full_publications(
                 pos,
                 ticket_level_for_status(needed_status),
                 None,
                 self.world_gen_context.min_y(),
                 self.world_gen_context.height(),
+                Arc::downgrade(&self.full_publications),
             ));
             if self.chunks.insert_sync(pos, holder).is_err() {
                 return Err(RegionGenerationError::MapInUse);
@@ -130,8 +127,9 @@ impl ChunkMap {
 
     /// Applies `step` to `positions`, listed in ascending X-then-Z order.
     ///
-    /// A chunk waits only for earlier chunks whose step areas overlap its own, so the result
-    /// equals applying the step to one chunk at a time in that order.
+    /// A chunk waits only for earlier chunks whose step areas overlap its own or, for Features,
+    /// that place pieces from the same structure starts. The result therefore equals applying
+    /// the step to one chunk at a time in that order.
     async fn generate_region_stage(
         self: &Arc<Self>,
         step: &'static ChunkStep,
@@ -142,20 +140,37 @@ impl ChunkMap {
         // Areas of radius `reach` overlap within twice that distance.
         let span = reach * 2;
         let mut tasks = FxHashMap::<ChunkPos, RegionTask>::default();
+        // Latest task that updates each structure-start chunk.
+        let mut start_users = FxHashMap::<ChunkPos, RegionTask>::default();
         for pos in positions {
-            let earlier = (pos.0.x - span..=pos.0.x)
+            let mut earlier = (pos.0.x - span..=pos.0.x)
                 .flat_map(|x| (pos.0.y - span..=pos.0.y + span).map(move |z| ChunkPos::new(x, z)))
                 .filter(|other| other.0.x < pos.0.x || other.0.y < pos.0.y)
                 .filter_map(|other| tasks.get(&other).cloned())
                 .collect::<Vec<_>>();
+            let starts = if step.target_status == ChunkStatus::Features {
+                self.referenced_structure_starts(pos)
+            } else {
+                Vec::new()
+            };
+            earlier.extend(
+                starts
+                    .iter()
+                    .filter_map(|start| start_users.get(start).cloned()),
+            );
             let chunk_map = Arc::clone(self);
             let task = async move {
                 for task in earlier {
                     task.await?;
                 }
                 chunk_map.apply_region_step(step, pos, cache_radius).await
-            };
-            tasks.insert(pos, task.boxed().shared());
+            }
+            .boxed()
+            .shared();
+            for start in starts {
+                start_users.insert(start, task.clone());
+            }
+            tasks.insert(pos, task);
         }
         join_all(tasks.into_values()).await.into_iter().collect()
     }
@@ -186,6 +201,19 @@ impl ChunkMap {
         }
     }
 
+    /// Returns the chunks holding structure starts that Features at `pos` places pieces from.
+    fn referenced_structure_starts(&self, pos: ChunkPos) -> Vec<ChunkPos> {
+        let holder = self.region_holder(pos);
+        let Some(chunk) = holder.try_chunk(ChunkStatus::StructureReferences) else {
+            panic!("Features dependencies must have structure references at {pos:?}");
+        };
+        let references = chunk.structure_references();
+        references
+            .values()
+            .flat_map(|sources| sources.iter().copied())
+            .collect()
+    }
+
     /// Returns a holder installed by [`Self::insert_region_holders`].
     fn region_holder(&self, pos: ChunkPos) -> Arc<ChunkHolder> {
         let Some(holder) = self.chunks.read_sync(&pos, |_, holder| Arc::clone(holder)) else {
@@ -195,13 +223,24 @@ impl ChunkMap {
     }
 }
 
-/// Returns how many chunks around its center a step may read while it modifies them.
+/// Returns how far around its center a step that modifies neighbors may read or write chunks.
 ///
-/// Light worksets light a whole cache window, wider than the step's declared dependencies.
+/// Block reads count only where the parent status guarantees generated blocks. Light worksets
+/// span a cache window wider than the Light step's declared dependencies.
 const fn region_step_reach(step: &ChunkStep) -> i32 {
+    let parent_radius = match step.target_status.parent() {
+        Some(parent) => step.direct_dependencies.get_radius_of(parent) as i32,
+        None => 0,
+    };
     match step.target_status {
         ChunkStatus::Light => LIGHT_CACHE_RADIUS,
-        _ if step.block_state_write_radius > 0 => step.block_state_write_radius,
+        _ if step.block_state_write_radius > 0 => {
+            if step.block_state_write_radius > parent_radius {
+                step.block_state_write_radius
+            } else {
+                parent_radius
+            }
+        }
         _ => 0,
     }
 }
